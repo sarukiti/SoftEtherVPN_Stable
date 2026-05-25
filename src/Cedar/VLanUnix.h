@@ -108,11 +108,6 @@
 // Constant
 #define	TAP_READ_BUF_SIZE			1600
 
-#ifdef	UNIX_MACOS
-// Size of the BPF read buffer used to back the macOS feth-based virtual NIC
-#define	MACOS_BPF_BUFSIZE			(128 * 1024)
-#endif	// UNIX_MACOS
-
 #ifndef	NO_VLAN
 
 // VLAN structure
@@ -121,15 +116,6 @@ struct VLAN
 	volatile bool Halt;			// Halt flag
 	char *InstanceName;			// Instance name
 	int fd;						// File
-#ifdef	UNIX_MACOS
-	// On macOS the fd is a /dev/bpf descriptor. BPF returns packets prefixed
-	// with struct bpf_hdr and may batch several per read(), so we buffer a
-	// whole read and hand out one frame at a time.
-	UCHAR *BpfBuffer;			// Read batch buffer
-	UINT BpfBufferSize;			// Allocated size of BpfBuffer
-	UINT BpfBufferUsed;			// Valid bytes from the last read()
-	UINT BpfBufferOff;			// Current parse offset within BpfBuffer
-#endif	// UNIX_MACOS
 };
 
 // Function prototype

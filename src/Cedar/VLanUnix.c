@@ -126,6 +126,33 @@
 
 #ifdef	OS_UNIX
 
+#ifdef	UNIX_MACOS
+// Size of the BPF read buffer used to back the macOS feth-based virtual NIC
+#define	MACOS_BPF_BUFSIZE			(128 * 1024)
+
+// fd -> feth interface names + BPF read buffer state.
+// The macOS fd is a /dev/bpf descriptor (no tap kext on Apple Silicon); see
+// the implementation block further down for how the feth pair is built.
+// BPF read() returns packets prefixed with struct bpf_hdr and may batch several
+// per read(), so we buffer a whole read and hand out one frame at a time. That
+// per-fd state lives here (keyed by fd) instead of in the shared VLAN struct,
+// so VLanUnix.h needs no macOS-specific fields.
+typedef struct MACOS_FETH_ENTRY
+{
+	int fd;
+	char host[16];		// host-side feth (carries the IP, OS routes through it)
+	char dev[16];		// dev-side feth (BPF attached)
+	UCHAR *BpfBuffer;	// Read batch buffer
+	UINT BpfBufferSize;	// Allocated size of BpfBuffer
+	UINT BpfBufferUsed;	// Valid bytes from the last read()
+	UINT BpfBufferOff;	// Current parse offset within BpfBuffer
+} MACOS_FETH_ENTRY;
+
+// Look up the feth/BPF entry for a bpf fd (linear scan; the list normally
+// holds just 1-2 entries). Returns NULL if none.
+static MACOS_FETH_ENTRY *MacOsFethFind(int fd);
+#endif	// UNIX_MACOS
+
 static LIST *unix_vlan = NULL;
 
 #ifndef	NO_VLAN
@@ -291,18 +318,28 @@ bool VLanGetNextPacket(VLAN *v, void **buf, UINT *size)
 	// On macOS the fd is a BPF descriptor: each read() returns zero or more
 	// frames, each prefixed by a struct bpf_hdr and padded to BPF_WORDALIGN.
 	// Hand out one frame per call, refilling the buffer when it drains.
+	// The buffer state is kept in the per-fd feth side-table, not in VLAN.
+	MACOS_FETH_ENTRY *e = MacOsFethFind(v->fd);
+	if (e == NULL || e->BpfBuffer == NULL)
+	{
+		// No backing buffer: treat as no packet
+		*buf = NULL;
+		*size = 0;
+		return true;
+	}
+
 	while (true)
 	{
 		struct bpf_hdr *bh;
 		UCHAR *frame;
 		UINT caplen;
 
-		if (v->BpfBufferOff < v->BpfBufferUsed)
+		if (e->BpfBufferOff < e->BpfBufferUsed)
 		{
-			bh = (struct bpf_hdr *)(v->BpfBuffer + v->BpfBufferOff);
+			bh = (struct bpf_hdr *)(e->BpfBuffer + e->BpfBufferOff);
 			caplen = bh->bh_caplen;
-			frame = v->BpfBuffer + v->BpfBufferOff + bh->bh_hdrlen;
-			v->BpfBufferOff += BPF_WORDALIGN(bh->bh_hdrlen + bh->bh_caplen);
+			frame = e->BpfBuffer + e->BpfBufferOff + bh->bh_hdrlen;
+			e->BpfBufferOff += BPF_WORDALIGN(bh->bh_hdrlen + bh->bh_caplen);
 
 			if (caplen == 0 || caplen > TAP_READ_BUF_SIZE)
 			{
@@ -317,7 +354,7 @@ bool VLanGetNextPacket(VLAN *v, void **buf, UINT *size)
 		}
 
 		// Buffer drained: pull a fresh batch
-		ret = read(v->fd, v->BpfBuffer, v->BpfBufferSize);
+		ret = read(v->fd, e->BpfBuffer, e->BpfBufferSize);
 		if (ret == 0 || (ret == -1 && errno == EAGAIN))
 		{
 			// No packet
@@ -330,8 +367,8 @@ bool VLanGetNextPacket(VLAN *v, void **buf, UINT *size)
 			return false;
 		}
 
-		v->BpfBufferUsed = ret;
-		v->BpfBufferOff = 0;
+		e->BpfBufferUsed = ret;
+		e->BpfBufferOff = 0;
 	}
 #else	// UNIX_MACOS
 	// Read
@@ -398,38 +435,11 @@ void FreeVLan(VLAN *v)
 
 	Free(v->InstanceName);
 
-#ifdef	UNIX_MACOS
-	if (v->BpfBuffer != NULL)
-	{
-		Free(v->BpfBuffer);
-	}
-#endif	// UNIX_MACOS
+	// On macOS the BPF read buffer is owned by the feth side-table entry and
+	// is freed when the feth pair is torn down (MacOsDestroyTap).
 
 	Free(v);
 }
-
-#ifdef	UNIX_MACOS
-// Allocate the per-VLAN BPF read buffer, sized to the kernel's bpf buffer length
-static void UnixVLanInitBpfBuffer(VLAN *v)
-{
-	UINT blen = 0;
-
-	if (v == NULL)
-	{
-		return;
-	}
-
-	if (ioctl(v->fd, BIOCGBLEN, &blen) < 0 || blen == 0)
-	{
-		blen = MACOS_BPF_BUFSIZE;
-	}
-
-	v->BpfBuffer = Malloc(blen);
-	v->BpfBufferSize = blen;
-	v->BpfBufferUsed = 0;
-	v->BpfBufferOff = 0;
-}
-#endif	// UNIX_MACOS
 
 // Create a tap
 VLAN *NewTap(char *name, char *mac_address)
@@ -452,10 +462,6 @@ VLAN *NewTap(char *name, char *mac_address)
 	v->Halt = false;
 	v->InstanceName = CopyStr(name);
 	v->fd = fd;
-
-#ifdef	UNIX_MACOS
-	UnixVLanInitBpfBuffer(v);
-#endif	// UNIX_MACOS
 
 	return v;
 }
@@ -497,10 +503,6 @@ VLAN *NewVLan(char *instance_name, VLAN_PARAM *param)
 	v->InstanceName = CopyStr(instance_name);
 	v->fd = fd;
 
-#ifdef	UNIX_MACOS
-	UnixVLanInitBpfBuffer(v);
-#endif	// UNIX_MACOS
-
 	return v;
 }
 
@@ -518,15 +520,9 @@ VLAN *NewVLan(char *instance_name, VLAN_PARAM *param)
 // the dev feth are delivered to the host feth as if received, reaching the
 // host IP stack. This was validated by poc/feth_bpf_poc.c.
 
-// fd -> feth interface names, so we can destroy the pair on close.
-// Only the create/destroy (cold) paths touch this list.
-typedef struct MACOS_FETH_ENTRY
-{
-	int fd;
-	char host[16];	// host-side feth (carries the IP, OS routes through it)
-	char dev[16];	// dev-side feth (BPF attached)
-} MACOS_FETH_ENTRY;
-
+// fd -> feth interface names + BPF read buffer state (MACOS_FETH_ENTRY is
+// declared near the top of this file). The create/destroy paths and the
+// per-frame read path (MacOsFethFind) touch this list.
 static LIST *macos_feth_list = NULL;
 
 static void MacOsFethInit()
@@ -535,6 +531,29 @@ static void MacOsFethInit()
 	{
 		macos_feth_list = NewList(NULL);
 	}
+}
+
+// Look up the feth/BPF entry for a bpf fd (linear scan; the list normally
+// holds just 1-2 entries). Returns NULL if none.
+static MACOS_FETH_ENTRY *MacOsFethFind(int fd)
+{
+	UINT i;
+
+	if (macos_feth_list == NULL)
+	{
+		return NULL;
+	}
+
+	for (i = 0; i < LIST_NUM(macos_feth_list); i++)
+	{
+		MACOS_FETH_ENTRY *e = LIST_DATA(macos_feth_list, i);
+		if (e->fd == fd)
+		{
+			return e;
+		}
+	}
+
+	return NULL;
 }
 
 // Run "ifconfig <args>" and return the first output line (caller frees), or NULL.
@@ -656,6 +675,20 @@ static int MacOsCreateTap(UCHAR *mac_address)
 	e->fd = fd;
 	StrCpy(e->host, sizeof(e->host), host);
 	StrCpy(e->dev, sizeof(e->dev), dev);
+
+	// Allocate the BPF read buffer, sized to the kernel's bpf buffer length.
+	{
+		UINT blen = 0;
+		if (ioctl(fd, BIOCGBLEN, &blen) < 0 || blen == 0)
+		{
+			blen = MACOS_BPF_BUFSIZE;
+		}
+		e->BpfBuffer = Malloc(blen);
+		e->BpfBufferSize = blen;
+		e->BpfBufferUsed = 0;
+		e->BpfBufferOff = 0;
+	}
+
 	Add(macos_feth_list, e);
 
 	Debug("MacOsCreateTap: host=%s dev=%s bpf_fd=%d\n", host, dev, fd);
@@ -700,6 +733,10 @@ static void MacOsDestroyTap(int fd)
 			MacOsIfconfig(args, false);
 			Format(args, sizeof(args), "%s destroy", e->dev);
 			MacOsIfconfig(args, false);
+			if (e->BpfBuffer != NULL)
+			{
+				Free(e->BpfBuffer);
+			}
 			Delete(macos_feth_list, e);
 			Free(e);
 			break;
