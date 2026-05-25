@@ -119,6 +119,9 @@
 #include <Cedar/Cedar.h>
 #ifdef	UNIX_MACOS
 #include <net/ethernet.h>
+#include <net/bpf.h>
+#include <net/if.h>
+#include <fcntl.h>
 #endif
 
 #ifdef	OS_UNIX
@@ -284,6 +287,53 @@ bool VLanGetNextPacket(VLAN *v, void **buf, UINT *size)
 		return false;
 	}
 
+#ifdef	UNIX_MACOS
+	// On macOS the fd is a BPF descriptor: each read() returns zero or more
+	// frames, each prefixed by a struct bpf_hdr and padded to BPF_WORDALIGN.
+	// Hand out one frame per call, refilling the buffer when it drains.
+	while (true)
+	{
+		struct bpf_hdr *bh;
+		UCHAR *frame;
+		UINT caplen;
+
+		if (v->BpfBufferOff < v->BpfBufferUsed)
+		{
+			bh = (struct bpf_hdr *)(v->BpfBuffer + v->BpfBufferOff);
+			caplen = bh->bh_caplen;
+			frame = v->BpfBuffer + v->BpfBufferOff + bh->bh_hdrlen;
+			v->BpfBufferOff += BPF_WORDALIGN(bh->bh_hdrlen + bh->bh_caplen);
+
+			if (caplen == 0 || caplen > TAP_READ_BUF_SIZE)
+			{
+				// Skip empty / oversized frames
+				continue;
+			}
+
+			*buf = Malloc(caplen);
+			Copy(*buf, frame, caplen);
+			*size = caplen;
+			return true;
+		}
+
+		// Buffer drained: pull a fresh batch
+		ret = read(v->fd, v->BpfBuffer, v->BpfBufferSize);
+		if (ret == 0 || (ret == -1 && errno == EAGAIN))
+		{
+			// No packet
+			*buf = NULL;
+			*size = 0;
+			return true;
+		}
+		else if (ret == -1)
+		{
+			return false;
+		}
+
+		v->BpfBufferUsed = ret;
+		v->BpfBufferOff = 0;
+	}
+#else	// UNIX_MACOS
 	// Read
 	ret = read(v->fd, tmp, sizeof(tmp));
 
@@ -308,6 +358,7 @@ bool VLanGetNextPacket(VLAN *v, void **buf, UINT *size)
 		*size = ret;
 		return true;
 	}
+#endif	// UNIX_MACOS
 }
 
 // Get the cancel object
@@ -347,8 +398,38 @@ void FreeVLan(VLAN *v)
 
 	Free(v->InstanceName);
 
+#ifdef	UNIX_MACOS
+	if (v->BpfBuffer != NULL)
+	{
+		Free(v->BpfBuffer);
+	}
+#endif	// UNIX_MACOS
+
 	Free(v);
 }
+
+#ifdef	UNIX_MACOS
+// Allocate the per-VLAN BPF read buffer, sized to the kernel's bpf buffer length
+static void UnixVLanInitBpfBuffer(VLAN *v)
+{
+	UINT blen = 0;
+
+	if (v == NULL)
+	{
+		return;
+	}
+
+	if (ioctl(v->fd, BIOCGBLEN, &blen) < 0 || blen == 0)
+	{
+		blen = MACOS_BPF_BUFSIZE;
+	}
+
+	v->BpfBuffer = Malloc(blen);
+	v->BpfBufferSize = blen;
+	v->BpfBufferUsed = 0;
+	v->BpfBufferOff = 0;
+}
+#endif	// UNIX_MACOS
 
 // Create a tap
 VLAN *NewTap(char *name, char *mac_address)
@@ -372,6 +453,10 @@ VLAN *NewTap(char *name, char *mac_address)
 	v->InstanceName = CopyStr(name);
 	v->fd = fd;
 
+#ifdef	UNIX_MACOS
+	UnixVLanInitBpfBuffer(v);
+#endif	// UNIX_MACOS
+
 	return v;
 }
 
@@ -384,7 +469,8 @@ void FreeTap(VLAN *v)
 		return;
 	}
 
-	close(v->fd);
+	// Routes through UnixCloseTapDevice so the macOS feth pair is torn down too
+	UnixCloseTapDevice(v->fd);
 	FreeVLan(v);
 }
 
@@ -411,8 +497,217 @@ VLAN *NewVLan(char *instance_name, VLAN_PARAM *param)
 	v->InstanceName = CopyStr(instance_name);
 	v->fd = fd;
 
+#ifdef	UNIX_MACOS
+	UnixVLanInitBpfBuffer(v);
+#endif	// UNIX_MACOS
+
 	return v;
 }
+
+#ifdef	UNIX_MACOS
+
+// macOS has no usable tap kext on Apple Silicon. Instead we build an
+// equivalent L2 endpoint out of a feth (if_fake) peer pair plus a /dev/bpf
+// descriptor, which needs no kernel extension:
+//
+//   <host feth>  <== peer ==>  <dev feth>  <-- BPF attached here
+//
+// The OS treats the host-side feth as the VPN virtual NIC (the user assigns
+// it an IP / DHCP). Frames the OS transmits on the host feth arrive on the
+// dev feth, where BPF read() delivers them to us. Frames we BPF write() on
+// the dev feth are delivered to the host feth as if received, reaching the
+// host IP stack. This was validated by poc/feth_bpf_poc.c.
+
+// fd -> feth interface names, so we can destroy the pair on close.
+// Only the create/destroy (cold) paths touch this list.
+typedef struct MACOS_FETH_ENTRY
+{
+	int fd;
+	char host[16];	// host-side feth (carries the IP, OS routes through it)
+	char dev[16];	// dev-side feth (BPF attached)
+} MACOS_FETH_ENTRY;
+
+static LIST *macos_feth_list = NULL;
+
+static void MacOsFethInit()
+{
+	if (macos_feth_list == NULL)
+	{
+		macos_feth_list = NewList(NULL);
+	}
+}
+
+// Run "ifconfig <args>" and return the first output line (caller frees), or NULL.
+static char *MacOsIfconfig(char *args, bool capture)
+{
+	char cmd[MAX_SIZE];
+	TOKEN_LIST *t;
+	char *ret = NULL;
+
+	Format(cmd, sizeof(cmd), "/sbin/ifconfig %s 2>/dev/null", args);
+	t = UnixExec(cmd);
+	if (t != NULL)
+	{
+		if (capture && t->NumTokens >= 1)
+		{
+			ret = CopyStr(t->Token[0]);
+		}
+		FreeToken(t);
+	}
+	return ret;
+}
+
+// Open a /dev/bpf device and bind it to the given interface.
+static int MacOsOpenBpf(char *ifname)
+{
+	char dev[32];
+	int fd = -1;
+	int i;
+	UINT blen = MACOS_BPF_BUFSIZE;
+	UINT yes = 1, no = 0;
+	struct ifreq ifr;
+
+	for (i = 0; i < 256; i++)
+	{
+		Format(dev, sizeof(dev), "/dev/bpf%d", i);
+		fd = open(dev, O_RDWR);
+		if (fd >= 0)
+		{
+			break;
+		}
+		if (errno == EBUSY)
+		{
+			continue;
+		}
+		if (errno == ENOENT)
+		{
+			break;
+		}
+	}
+	if (fd < 0)
+	{
+		return -1;
+	}
+
+	// Buffer length must be set before BIOCSETIF
+	ioctl(fd, BIOCSBLEN, &blen);
+
+	Zero(&ifr, sizeof(ifr));
+	StrCpy(ifr.ifr_name, sizeof(ifr.ifr_name), ifname);
+	if (ioctl(fd, BIOCSETIF, &ifr) < 0)
+	{
+		close(fd);
+		return -1;
+	}
+
+	ioctl(fd, BIOCIMMEDIATE, &yes);	// return as soon as a packet arrives
+	ioctl(fd, BIOCSHDRCMPLT, &yes);	// we supply complete link-layer headers
+	ioctl(fd, BIOCSSEESENT, &no);	// don't loop back our own injected frames
+
+	return fd;
+}
+
+// Create a feth peer pair, attach BPF, return the bpf fd (or -1).
+static int MacOsCreateTap(UCHAR *mac_address)
+{
+	char *host = NULL, *dev = NULL;
+	char args[MAX_SIZE];
+	int fd = -1;
+	MACOS_FETH_ENTRY *e;
+
+	MacOsFethInit();
+
+	// Auto-allocate two feth interfaces (ifconfig prints the chosen name)
+	host = MacOsIfconfig("feth create", true);
+	dev = MacOsIfconfig("feth create", true);
+	if (host == NULL || dev == NULL || host[0] == 0 || dev[0] == 0)
+	{
+		goto FAILED;
+	}
+
+	// Peer them
+	Format(args, sizeof(args), "%s peer %s", host, dev);
+	MacOsIfconfig(args, false);
+
+	// The OS originates frames on the host feth, so its MAC must be the
+	// virtual NIC MAC that the VPN side sees.
+	if (mac_address != NULL)
+	{
+		Format(args, sizeof(args), "%s lladdr %02x:%02x:%02x:%02x:%02x:%02x",
+			host, mac_address[0], mac_address[1], mac_address[2],
+			mac_address[3], mac_address[4], mac_address[5]);
+		MacOsIfconfig(args, false);
+	}
+
+	// Bring both up
+	Format(args, sizeof(args), "%s up", host);
+	MacOsIfconfig(args, false);
+	Format(args, sizeof(args), "%s up", dev);
+	MacOsIfconfig(args, false);
+
+	// Attach BPF to the dev side
+	fd = MacOsOpenBpf(dev);
+	if (fd == -1)
+	{
+		goto FAILED;
+	}
+
+	e = ZeroMalloc(sizeof(MACOS_FETH_ENTRY));
+	e->fd = fd;
+	StrCpy(e->host, sizeof(e->host), host);
+	StrCpy(e->dev, sizeof(e->dev), dev);
+	Add(macos_feth_list, e);
+
+	Debug("MacOsCreateTap: host=%s dev=%s bpf_fd=%d\n", host, dev, fd);
+
+	Free(host);
+	Free(dev);
+	return fd;
+
+FAILED:
+	if (host != NULL)
+	{
+		Format(args, sizeof(args), "%s destroy", host);
+		MacOsIfconfig(args, false);
+		Free(host);
+	}
+	if (dev != NULL)
+	{
+		Format(args, sizeof(args), "%s destroy", dev);
+		MacOsIfconfig(args, false);
+		Free(dev);
+	}
+	return -1;
+}
+
+// Destroy the feth pair associated with the given bpf fd.
+static void MacOsDestroyTap(int fd)
+{
+	UINT i;
+	char args[MAX_SIZE];
+
+	if (macos_feth_list == NULL)
+	{
+		return;
+	}
+
+	for (i = 0; i < LIST_NUM(macos_feth_list); i++)
+	{
+		MACOS_FETH_ENTRY *e = LIST_DATA(macos_feth_list, i);
+		if (e->fd == fd)
+		{
+			Format(args, sizeof(args), "%s destroy", e->host);
+			MacOsIfconfig(args, false);
+			Format(args, sizeof(args), "%s destroy", e->dev);
+			MacOsIfconfig(args, false);
+			Delete(macos_feth_list, e);
+			Free(e);
+			break;
+		}
+	}
+}
+
+#endif	// UNIX_MACOS
 
 // Create a tap device
 int UnixCreateTapDeviceEx(char *name, char *prefix, UCHAR *mac_address)
@@ -440,6 +735,11 @@ int UnixCreateTapDeviceEx(char *name, char *prefix, UCHAR *mac_address)
 	Format(eth_name, sizeof(eth_name), "%s_%s", prefix, instance_name_lower);
 
 	eth_name[15] = 0;
+
+#ifdef	UNIX_MACOS
+	// macOS: build the L2 endpoint from a feth pair + BPF (no kext required).
+	return MacOsCreateTap(mac_address);
+#endif	// UNIX_MACOS
 
 	// Open the tun / tap
 #ifndef	UNIX_MACOS
@@ -641,6 +941,11 @@ void UnixCloseTapDevice(int fd)
 	{
 		return;
 	}
+
+#ifdef	UNIX_MACOS
+	// Tear down the feth pair backing this bpf descriptor
+	MacOsDestroyTap(fd);
+#endif	// UNIX_MACOS
 
 	close(fd);
 }

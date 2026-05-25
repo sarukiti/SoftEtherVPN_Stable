@@ -143,6 +143,10 @@ struct statfs {
 #else	// NO_VLAN
 #include <sys/mount.h>
 #endif	// NO_VLAN
+// macOS system headers (mach/*) pull in <stdbool.h>, which does
+// "#define bool _Bool" and shadows Mayaqua's "typedef unsigned int bool".
+// Undo it so the bool type stays consistent with the prototypes.
+#undef bool
 #endif	// UNIX_MACOS
 
 // Scandir() function for Solaris
@@ -309,9 +313,9 @@ OS_DISPATCH_TABLE *UnixGetDispatchTable()
 	return &t;
 }
 
-static void *signal_received_for_ignore(int sig, siginfo_t *info, void *ucontext) 
+static void signal_received_for_ignore(int sig, siginfo_t *info, void *ucontext)
 {
-	return NULL;
+	return;
 }
 
 // Ignore the signal flew to the thread
